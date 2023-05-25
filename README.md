@@ -1,11 +1,10 @@
 ### Overview
 
-This is a simple project showing the inconsistency in transaction names given by `newrelic-java-agent`, depending on
-Spring Boot major version and Spring Cloud OpenFeign's `@EnableFeignClients` annotation.
+This is a simple project showing the inconsistency in transaction names given by `newrelic-java-agent`, depending on the order of class loading (making it non-deterministic between different applications and innocuous classpath changes in the same application).
 
 ### Steps to reproduce
 
-1. Configure New Relic Java Agent 8.0.1 as per instructions at https://docs.newrelic.com/install/java/ (`newrelic.yml` used
+1. Configure New Relic Java Agent 8.2.0 as per instructions at https://docs.newrelic.com/install/java/ (`newrelic.yml` used
    for tests can be found in `src/main/resources` - it has not been modified apart from `app_name`, `license_key`
    and `log_level`).
 2. Run `./gradlew clean bootJar`
@@ -13,48 +12,16 @@ Spring Boot major version and Spring Cloud OpenFeign's `@EnableFeignClients` ann
 4. Access the endpoint at `http://localhost:8080/hello` - e.g. `curl http://localhost:8080/hello`.
 5. Check the transaction name of the request at `https://one.newrelic.com/data-exploration`,
    e.g. `SELECT appName, http.statusCode, name, transactionSubType, transactionType FROM Transaction WHERE transactionType = 'Web' AND appName = 'myapptest'`:
-    * it will be `WebTransaction/Servlet/dispatcherServlet` (**unexpected** - this is because there is
-      annotation `@EnableFeignClients(basePackageClasses = TestClient.class)`
-      in `src/main/java/com/example/demo/DemoApplication.java`)
+    * it will be `WebTransaction/Servlet/dispatcherServlet` (**unexpected** - this is because `ClassLoadingOrderEnforcer` loads `TestNonController` class first, and `TestController` last).
 
-6. Change the annotation in `src/main/java/com/example/demo/DemoApplication.java` file
-   to `@EnableFeignClients(basePackages = "com.example.demo")` and run steps 2-5 again:
+6. Change the order of class loading by commenting out the `not ok` section and uncommenting `ok` (ensuring that `TestController` class is loaded first and `TestNonController` last) and run steps 2-5 again:
     * it will be `WebTransaction/SpringController/hello (GET)` (**expected**)
 
-7. Restore the annotation to `@EnableFeignClients(basePackageClasses = TestClient.class)`, downgrade Spring Boot and Spring Cloud in `build.gradle`:
-    ```
-    plugins {
-        ...
-        id 'org.springframework.boot' version '2.7.10'
-        ...
-    }
-    ...
-    dependencyManagement {
-        imports {
-            mavenBom "org.springframework.cloud:spring-cloud-dependencies:2021.0.6"
-        }
-    }
-    ...
-    ```
-   and run steps 2-5 again:
-    * it will be `WebTransaction/SpringController/TestController/sayHello` (**unexpected** - why different
-      than `WebTransaction/SpringController/hello (GET)`?)
+### Results screenshot
 
-### Results screenshot and summary
-
-The following screenshot presents the results at `one.newrelic.com` (all entries are from the same application and the
-same `GET /hello` request, but with various libraries versions and `@EnableFeignClients` parameters):
+The following screenshot presents the results at `one.newrelic.com` (both entries are from the same application and the same `GET /hello` request, but with the different order of class loading). 
 
 ![NewRelic events](newrelic-events.png)
-
-The following table provides a summary for the tested cases:
-
-| Spring Boot | Spring Cloud / OpenFeign |  Annotation                                                                                                        | Transaction name at one.newrelic.com                    | Expected? |
-|-------------|-------------------------------|-------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------|---------|
-| 2.7.10      | 2021.0.6 / 3.1.6     | none or `@EnableFeignClients(basePackages = "com.example.demo")`                                                  | WebTransaction/SpringController/hello (GET)             | :heavy_check_mark: Y |
-| 2.7.10      | 2021.0.6 / 3.1.6     | `@EnableFeignClients(basePackageClasses = TestClient.class)` or `@EnableFeignClients(clients = TestClient.class)` | WebTransaction/SpringController/TestController/sayHello | :warning: N (not sure why changed?) |
-| 3.0.5       | 2022.0.2 / 4.0.2     | none or `@EnableFeignClients(basePackages = "com.example.demo")`                                                  | WebTransaction/SpringController/hello (GET)             | :heavy_check_mark: Y |
-| 3.0.5       | 2022.0.2 / 4.0.2     | `@EnableFeignClients(basePackageClasses = TestClient.class)` or `@EnableFeignClients(clients = TestClient.class)` | WebTransaction/Servlet/dispatcherServlet                | :x: N (does not have required information) |
 
 ### New Relic Agent log entries
 
@@ -68,18 +35,53 @@ com.newrelic FINE: 	com/nr/agent/instrumentation/SpringController_Instrumentatio
 com.newrelic FINE: 	com/nr/agent/instrumentation/SpringController_Instrumentation.sayHello:()Ljava/lang/String;
 ```
 
-* When the generated transaction name is `WebTransaction/SpringController/TestController/sayHello`:
-
-```
-com.newrelic FINEST: Skipping instrumentation module com.newrelic.instrumentation.spring-4.3.0. The most likely cause is that com.newrelic.instrumentation.spring-4.3.0 shouldn't apply to this application.
-...
-com.newrelic FINER: Setting transaction name to "/TestController/sayHello" using Spring controller
-com.newrelic FINEST: Setting transaction name to "/TestController/sayHello" for transaction com.newrelic.agent.Transaction@80c7de4 using LEGACY scheme
-```
-
 * When the generated transaction name is `WebTransaction/Servlet/dispatcherServlet` (in this case there are no lines
   containing `TestController`):
 
 ```
 com.newrelic FINEST: Skipping instrumentation module com.newrelic.instrumentation.spring-4.3.0. The most likely cause is that com.newrelic.instrumentation.spring-4.3.0 shouldn't apply to this application.
 ```
+
+
+### Analysis
+
+The root issue seems to be a too broad cache key in [WeavePackageManager#validPackages](https://github.com/newrelic/newrelic-java-agent/blob/7ee30b57089e6817a93832eb6492500579046724/newrelic-weaver/src/main/java/com/newrelic/weave/weavepackage/WeavePackageManager.java#L92), resulting in `PackageValidationResult` from one class (with weaving violations) being used for another class (without weaving violations).
+
+Consider the following classes:
+* `com.example.demo.TestNonController` - class for which [spring-4.3.0 instrumentation](https://github.com/newrelic/newrelic-java-agent/blob/7ee30b57089e6817a93832eb6492500579046724/instrumentation/spring-4.3.0/src/main/java/com/nr/agent/instrumentation/SpringController_Instrumentation.java) should not apply (as there is `@GetMapping` but there is no `@RestController` mapping)
+* `com.example.demo.TestController` - class for which spring-4.3.0 instrumentation should apply
+
+The following happens when `TestNonController` class is loaded before `TestController` class:
+```
+ClassLoader#loadClass("com.example.demo.TestNonController")
+|- ClassWeaverService#transform
+|--- WeavePackageManager#weave
+|----- WeavePackageManager#match
+|------- WeavePackageManager#validateAgainstClassLoader
+|--------- ! hasValidated returns false (because validPackages does not contain entry for spring-4.3.0 weave package)
+|--------- WeavePackage#validate -> returns PackageValidationResult with 0 violations
+|--------- store PackageValidationResult in validPackages 
+|------- returns PackageValidationResult with 0 violations
+|----- PackageValidationResult#weave (for class name "com.example.demo.TestNonController")
+|------- PackageValidationResult#getAnnotationMatchComposite
+|--------- PackageValidationResult#buildResults
+|----------- ClassMatch#match -> returns violation CLASS_MISSING_REQUIRED_ANNOTATIONS (correctly, as this class does not have `@RestController` and `@Controller` annotations)
+|----------- !!! add the violation to violations collection
+|--------- don't weave the class because violations collection is not empty (correctly)
+
+ClassLoader#loadClass("com.example.demo.TestController")
+|- ClassWeaverService#transform
+|--- WeavePackageManager#weave
+|----- WeavePackageManager#match   
+|------- WeavePackageManager#validateAgainstClassLoader
+|--------- !!! hasValidated returns true (because validPackages contains PackageValidationResult with the violation added during loading "com.example.demo.TestNonController" class)
+|------- returns PackageValidationResult with 1 violation (from TestNonController class)
+|----- PackageValidationResult#weave (for class name "com.example.demo.TestController")
+|------- PackageValidationResult#getAnnotationMatchComposite
+|--------- PackageValidationResult#buildResults
+|----------- ClassMatch#match -> returns no violation (correctly, as this class has `@RestController` annotation)
+|----------- !!! adds no violation to the collection, but the collection already contains 1 violation (from TestNonController class)
+|--------- !!! don't weave the class because violations collection is not empty (incorrectly)
+```
+
+Thus, if `TestNonController` is loaded first, no controllers will be woven afterwards, as the violations from `TestNonController` will be cached in `WeavePackageManager#validPackages` and reused for next classes.
