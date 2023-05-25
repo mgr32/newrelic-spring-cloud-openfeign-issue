@@ -1,7 +1,10 @@
 ### Overview
 
+**Please check [simpler-example-with-analysis](https://github.com/mgr32/newrelic-spring-cloud-openfeign-issue/tree/simpler-example-with-analysis) branch for a simpler example and additional analysis**.
+
 This is a simple project showing the inconsistency in transaction names given by `newrelic-java-agent`, depending on
 Spring Boot major version and Spring Cloud OpenFeign's `@EnableFeignClients` annotation.
+
 
 ### Steps to reproduce
 
