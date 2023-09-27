@@ -18,7 +18,7 @@ public class WebSecurityConfig {
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http.authorizeHttpRequests((requests) -> requests
-                .requestMatchers("/hello-secured").authenticated()
+                .mvcMatchers("/hello-secured").authenticated()
                 .anyRequest().permitAll()
         );
         http.httpBasic(Customizer.withDefaults());
