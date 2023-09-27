@@ -10,4 +10,9 @@ public class TestController {
     public String sayHello() {
         return "hello";
     }
+
+    @GetMapping("/hello-secured")
+    public String sayHelloSecured() {
+        return "hello-secured";
+    }
 }
